@@ -1,6 +1,8 @@
 import os
+import pathlib
 import re
 import torch
+import safetensors
 
 from diffusion.utils.logger import get_root_logger
 
@@ -48,7 +50,7 @@ def load_checkpoint(checkpoint,
                     max_length=120,
                     ):
     assert isinstance(checkpoint, str)
-    ckpt_file = checkpoint
+    ckpt_file = pathlib.Path(checkpoint)
     checkpoint = torch.load(ckpt_file, map_location="cpu")
 
     state_dict_keys = ['pos_embed', 'base_model.pos_embed', 'model.pos_embed']

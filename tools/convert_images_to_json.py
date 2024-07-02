@@ -20,6 +20,7 @@ def main():
     output_folder = args[-1]
 
     caption_extension = '.txt'
+    alt_caption_extension = '.alttxt'
     try:
         caption_arg = args.index('--caption_extension')
         caption_extension = args[caption_arg + 1]
@@ -54,16 +55,23 @@ def main():
                 for image_extension in ['.jpg', '.png', '.jpeg', 'webp']:
                     image_path = Path(dirpath).joinpath(image_filename + image_extension)
                     if path.exists(image_path):
-                        write_entry(json_entries, dirpath, image_path, Path(dirpath).joinpath(filename), image_filename + image_extension, intern_imgs_folder)
+                        write_entry(json_entries, dirpath, image_path, Path(dirpath).joinpath(filename), image_filename + image_extension, intern_imgs_folder, Path(dirpath).joinpath(image_filename + alt_caption_extension))
                         break
     
         # use the entries
         json_file.write(json.dumps(json_entries))
 
-def write_entry(json_entries, folder, image_path, caption_path, image_filename, intern_imgs_path):
+def write_entry(json_entries, folder, image_path, caption_path, image_filename, intern_imgs_path, alt_caption_path):
     # open the file containing the prompt
     with open(caption_path) as prompt_file:
+
+
+
         prompt = prompt_file.read()
+        try:
+            alt = open(alt_caption_path).read()
+        except:
+            alt = prompt
 
         # read the images info
         image = Image.open(image_path)
@@ -77,7 +85,7 @@ def write_entry(json_entries, folder, image_path, caption_path, image_filename, 
         entry['ratio'] = ratio
         entry['path'] = image_filename
         entry['prompt'] = prompt
-        entry['sharegpt4v'] = ''
+        entry['sharegpt4v'] = alt or prompt
 
         json_entries.append(entry)
 

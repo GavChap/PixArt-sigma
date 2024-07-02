@@ -10,8 +10,8 @@ image_size = 2048
 
 # model setting
 model = 'PixArtMS_XL_2'
-mixed_precision = 'fp16'
-fp32_attention = True
+mixed_precision = 'bf16'
+fp32_attention = False
 load_from = None
 resume_from = None
 vae_pretrained = "output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers/vae"  # sdxl vae
@@ -21,13 +21,13 @@ pe_interpolation = 4.0
 
 # training setting
 num_workers = 10
-train_batch_size = 4  # 48
-num_epochs = 10  # 3
+train_batch_size = 3  # 48
+num_epochs = 3  # 3
 gradient_accumulation_steps = 1
 grad_checkpointing = True
 gradient_clip = 0.01
-optimizer = dict(type='CAMEWrapper', lr=2e-5, weight_decay=0.0, betas=(0.9, 0.999, 0.9999), eps=(1e-30, 1e-16))
-lr_schedule_args = dict(num_warmup_steps=100)
+optimizer = dict(type='CAMEWrapper', lr=1e-5, weight_decay=0.0, betas=(0.9, 0.999, 0.9999), eps=(1e-30, 1e-16))
+lr_schedule_args = dict(num_warmup_steps=50)
 
 eval_sampling_steps = 100
 visualize = True

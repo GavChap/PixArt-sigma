@@ -1,11 +1,13 @@
 import argparse
 import datetime
+import gc
 import os
 import sys
 import time
 import types
 import warnings
 from pathlib import Path
+from pickle import dump
 
 current_file_path = Path(__file__).resolve()
 sys.path.insert(0, str(current_file_path.parent.parent))
@@ -33,6 +35,9 @@ from diffusion.utils.optimizer import build_optimizer, auto_scale_lr
 
 warnings.filterwarnings("ignore")  # ignore warning
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
 
 def set_fsdp_env():
     os.environ["ACCELERATE_USE_FSDP"] = 'true'
@@ -42,8 +47,8 @@ def set_fsdp_env():
 
 
 @torch.inference_mode()
-def log_validation(model, step, device, vae=None):
-    torch.cuda.empty_cache()
+def log_validation(model, step, device, vae=None, noise=None):
+    flush()
     model = accelerator.unwrap_model(model).eval()
     hw = torch.tensor([[image_size, image_size]], dtype=torch.float, device=device).repeat(1, 1)
     ar = torch.tensor([[1.]], device=device).repeat(1, 1)
@@ -54,10 +59,10 @@ def log_validation(model, step, device, vae=None):
     logger.info("Running validation... ")
     image_logs = []
     latents = []
-    
+
     for prompt in validation_prompts:
-        if validation_noise is not None:
-            z = torch.clone(validation_noise).to(device)
+        if noise is not None:
+            z = torch.clone(noise).to(device)
         else:
             z = torch.randn(1, 4, latent_size, latent_size, device=device)
         embed = torch.load(f'output/tmp/{prompt}_{max_length}token.pth', map_location='cpu')
@@ -80,7 +85,8 @@ def log_validation(model, step, device, vae=None):
         )
         latents.append(denoised)
 
-    torch.cuda.empty_cache()
+    del model, caption_embs, emb_masks
+    flush()
     if vae is None:
         vae = AutoencoderKL.from_pretrained(config.vae_pretrained).to(accelerator.device).to(torch.float16)
     for prompt, latent in zip(validation_prompts, latents):
@@ -89,7 +95,7 @@ def log_validation(model, step, device, vae=None):
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()[0]
         image = Image.fromarray(samples)
         image_logs.append({"validation_prompt": prompt, "images": [image]})
-
+        image.save(f'output/tmp/{step}_{prompt}_{max_length}token.jpg')
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             for log in image_logs:
@@ -119,6 +125,7 @@ def log_validation(model, step, device, vae=None):
 
     del vae
     flush()
+
     return image_logs
 
 
@@ -138,12 +145,19 @@ def train():
         data_time_start= time.time()
         data_time_all = 0
         for step, batch in enumerate(train_dataloader):
+            if config.visualize and (global_step % config.eval_sampling_steps == 0 or (step + 1) == 1):
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    log_validation(model, global_step, device=accelerator.device, vae=vae, noise=validation_noise)
+
             if step < skip_step:
                 global_step += 1
                 continue    # skip data in the resumed ckpt
             if load_vae_feat:
+                logger.info("Load VAE True")
                 z = batch[0]
             else:
+                logger.info("Load VAE False")
                 with torch.no_grad():
                     with torch.cuda.amp.autocast(enabled=(config.mixed_precision == 'fp16' or config.mixed_precision == 'bf16')):
                         posterior = vae.encode(batch[0]).latent_dist
@@ -156,9 +170,12 @@ def train():
             data_info = batch[3]
 
             if load_t5_feat:
+                logger.info("Load T5 True")
                 y = batch[1]
                 y_mask = batch[2]
             else:
+                logger.info("Load T5 False")
+
                 with torch.no_grad():
                     txt_tokens = tokenizer(
                         batch[1], max_length=max_length, padding="max_length", truncation=True, return_tensors="pt"
@@ -172,9 +189,10 @@ def train():
             timesteps = torch.randint(0, config.train_sampling_steps, (bs,), device=clean_images.device).long()
             grad_norm = None
             data_time_all += time.time() - data_time_start
+            print("Accumulating")
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss_term = train_diffusion.training_losses(model, clean_images, timesteps, model_kwargs=dict(y=y, mask=y_mask, data_info=data_info))
                 loss = loss_term['loss'].mean()
                 accelerator.backward(loss)
@@ -182,6 +200,8 @@ def train():
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
                 optimizer.step()
                 lr_scheduler.step()
+            print("Accumulated")
+
 
             lr = lr_scheduler.get_last_lr()[0]
             logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
@@ -211,21 +231,10 @@ def train():
             global_step += 1
             data_time_start = time.time()
 
-            if config.save_model_steps and global_step % config.save_model_steps == 0:
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    os.umask(0o000)
-                    save_checkpoint(os.path.join(config.work_dir, 'checkpoints'),
-                                    epoch=epoch,
-                                    step=global_step,
-                                    model=accelerator.unwrap_model(model),
-                                    optimizer=optimizer,
-                                    lr_scheduler=lr_scheduler
-                                    )
-            if config.visualize and (global_step % config.eval_sampling_steps == 0 or (step + 1) == 1):
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    log_validation(model, global_step, device=accelerator.device, vae=vae)
+        # save a snapshot of the memory allocations
+        s = torch.cuda.memory.memory_snapshot()
+        with open(f"snapshot{epoch}.pickle", "wb") as f:
+            dump(s, f)
 
         if epoch % config.save_model_epochs == 0 or epoch == config.num_epochs:
             accelerator.wait_for_everyone()
@@ -238,12 +247,18 @@ def train():
                                 optimizer=optimizer,
                                 lr_scheduler=lr_scheduler
                                 )
+                flush()
+
+
+    if accelerator.is_main_process:
         accelerator.wait_for_everyone()
+        log_validation(model, global_step, device=accelerator.device, vae=vae, noise=validation_noise)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Process some integers.")
     parser.add_argument("config", type=str, help="config")
+    parser.add_argument('--data-root', type=str, help="Dataset directory")
     parser.add_argument("--cloud", action='store_true', default=False, help="cloud or local machine")
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument('--resume-from', help='the dir to resume the training')
@@ -314,6 +329,7 @@ if __name__ == '__main__':
     even_batches = True
     if config.multi_scale:
         even_batches=False,
+
 
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
@@ -394,12 +410,11 @@ if __name__ == '__main__':
             torch.save(
                 {'uncond_prompt_embeds': null_token_emb, 'uncond_prompt_embeds_mask': null_tokens.attention_mask},
                 f'output/pretrained_models/null_embed_diffusers_{max_length}token.pth')
-            del null_tokens
-            del null_token_emb
-            
             if config.data.load_t5_feat:
                 del tokenizer
                 del text_encoder
+            del null_token_emb
+            del null_tokens
             flush()
 
     model_kwargs = {"pe_interpolation": config.pe_interpolation, "config": config,
@@ -408,6 +423,7 @@ if __name__ == '__main__':
 
     # build models
     train_diffusion = IDDPM(str(config.train_sampling_steps), learn_sigma=learn_sigma, pred_sigma=pred_sigma, snr=config.snr_loss)
+    logger.info("Building model")
     model = build_model(config.model,
                         config.grad_checkpointing,
                         config.get('fp32_attention', False),
@@ -431,7 +447,7 @@ if __name__ == '__main__':
             m.clip_grad_norm_ = types.MethodType(clip_grad_norm_, m)
 
     # build dataloader
-    set_data_root(config.data_root)
+    set_data_root(args.data_root or config.data_root)
     dataset = build_dataset(
         config.data, resolution=image_size, aspect_ratio_type=config.aspect_ratio_type,
         real_prompt_ratio=config.real_prompt_ratio, max_length=max_length, config=config,
@@ -485,4 +501,11 @@ if __name__ == '__main__':
     # objects in the same order you gave them to the prepare method.
     model = accelerator.prepare(model)
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+
+    # tell CUDA to start recording memory allocations
+    torch.cuda.memory._record_memory_history(enabled=True)
     train()
+
+
+    # tell CUDA to stop recording memory allocations now
+    torch.cuda.memory._record_memory_history(enabled=False)

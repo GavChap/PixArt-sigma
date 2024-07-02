@@ -12,7 +12,7 @@ from typing import Tuple, Optional, Callable
 
 import torch
 from torch.optim.optimizer import Optimizer
-from came_pytorch import CAME
+from diffusion.utils.CAME import CAME
 
 
 def auto_scale_lr(effective_bs, optimizer_cfg, rule='linear', base_batch_size=256):

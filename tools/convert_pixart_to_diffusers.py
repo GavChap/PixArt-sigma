@@ -78,7 +78,9 @@ def main(args):
     converted_state_dict["adaln_single.linear.weight"] = state_dict.pop("t_block.1.weight")
     converted_state_dict["adaln_single.linear.bias"] = state_dict.pop("t_block.1.bias")
 
-    for depth in range(28):
+    detectedDepth = sum(key.endswith('.attn.proj.bias') for key in state_dict.keys())
+    print(f"Depth: {detectedDepth}")
+    for depth in range(detectedDepth):
         # Transformer blocks.
         converted_state_dict[f"transformer_blocks.{depth}.scale_shift_table"] = state_dict.pop(
             f"blocks.{depth}.scale_shift_table"
@@ -157,7 +159,7 @@ def main(args):
     # PixArt XL/2
     transformer = Transformer2DModel(
         sample_size=args.image_size // 8,
-        num_layers=28,
+        num_layers=detectedDepth,
         attention_head_dim=72,
         in_channels=4,
         out_channels=8,
